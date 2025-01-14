@@ -1,0 +1,309 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from tkcalendar import DateEntry
+import pandas as pd
+import yfinance as yf
+from datetime import datetime
+import threading
+from pathlib import Path
+import logging
+import sys
+
+class OHLCDownloader:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("OHLC Data Downloader")
+        self.save_location = None
+        self.download_in_progress = False  # Add flag to track download status
+        
+        # Add window close handler
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        self.setup_logging()
+        self.setup_ui()
+        
+    def on_closing(self):
+        """Handle window close event"""
+        if self.download_in_progress:
+            if messagebox.askokcancel("Quit", "A download is in progress. Are you sure you want to quit?\nNo data will be saved."):
+                self.interrupt_flag = True
+                self.root.after(500, self.force_quit)  # Increased wait time for cleanup
+            return  # Don't close if user cancels
+        self.force_quit()
+    
+    def force_quit(self):
+        """Force quit the application"""
+        try:
+            self.root.quit()
+            self.root.destroy()
+        finally:
+            sys.exit(0)
+
+    def setup_logging(self):
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('ohlc_download.log'),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+
+    def setup_ui(self):
+        # Header Label with bold text
+        header = ttk.Label(self.root, 
+                          text="This widgets lets you download OHLC & volume for equity & ETF counters available on Yahoo Finance.\n" +
+                            "Index data does not need a tool, and can be directly downloaded from the site.", 
+                          style='Bold.TLabel',
+                          wraplength=600, 
+                          justify='center')
+        
+        # Create bold style
+        bold_style = ttk.Style()
+        bold_style.configure('Bold.TLabel', font=('TkDefaultFont', 9, 'bold'))
+        
+        header.pack(pady=10, padx=10)
+
+        # Input Frame with ticker input and upload button
+        input_frame = ttk.Frame(self.root)
+        input_frame.pack(fill='x', padx=20, pady=5)
+
+        ticker_frame = ttk.LabelFrame(input_frame, text="Enter tickers separated by comma or line breaks to pull OHLC data for")
+        ticker_frame.pack(side='left', fill='both', expand=True, padx=(0, 5))
+        
+        self.ticker_text = tk.Text(ticker_frame, height=3)
+        self.ticker_text.pack(fill='both', expand=True, padx=5, pady=5)
+
+        upload_frame = ttk.Frame(input_frame)
+        upload_frame.pack(side='right', fill='y')
+        
+        upload_btn = ttk.Button(upload_frame, text="or upload\nticker list", command=self.load_tickers)
+        upload_btn.pack(fill='both', expand=True)
+
+        # Main control container to match input frame width
+        control_container = ttk.Frame(self.root)
+        control_container.pack(fill='x', padx=20, pady=10)
+
+        # All frames need equal height but different widths
+        frame_height = 100
+        date_width = 160     # Keep date frame width
+        freq_width = 250     # Wider frequency frame
+        action_width = 400   # Wider action frame
+
+        # First frame - Date Range
+        date_frame = ttk.LabelFrame(control_container, text="Date Range", width=date_width, height=frame_height)
+        date_frame.pack(side='left', padx=5)
+        date_frame.pack_propagate(False)
+
+        # Row 1 - Start Date
+        date_row1 = ttk.Frame(date_frame)
+        date_row1.pack(fill='x', pady=(15, 5), padx=5)
+        ttk.Label(date_row1, text="Start Date:", width=10).pack(side='left')  # Increased label width
+        self.start_date = DateEntry(date_row1, width=8, background='darkblue', foreground='white')
+        self.start_date.pack(side='left', padx=(2, 0))
+        
+        # Row 2 - End Date
+        date_row2 = ttk.Frame(date_frame)
+        date_row2.pack(fill='x', pady=(5, 15), padx=5)
+        ttk.Label(date_row2, text="End Date:", width=10).pack(side='left')    # Increased label width
+        self.end_date = DateEntry(date_row2, width=8, background='darkblue', foreground='white')
+        self.end_date.pack(side='left', padx=(2, 0))
+
+        # Second frame - Frequency with horizontal radio buttons
+        freq_frame = ttk.LabelFrame(control_container, text="Frequency", width=freq_width, height=frame_height)
+        freq_frame.pack(side='left', padx=5)
+        freq_frame.pack_propagate(False)
+
+        radio_container = ttk.Frame(freq_frame)
+        radio_container.pack(expand=True)
+        
+        self.freq_var = tk.StringVar(value='1d')
+        frequencies = [('Daily', '1d'), ('Weekly', '1wk'), ('Monthly', '1mo')]
+        
+        radio_frame = ttk.Frame(radio_container)
+        radio_frame.pack(pady=20)  # Center vertically
+        
+        for text, value in frequencies:
+            ttk.Radiobutton(radio_frame, text=text, value=value,
+                          variable=self.freq_var).pack(side='left', padx=8)  # Increased padding between radio buttons
+
+        # Third frame - Actions with buttons and warning side by side
+        action_frame = ttk.LabelFrame(control_container, text="Actions", width=action_width, height=frame_height)
+        action_frame.pack(side='left', padx=5)
+        action_frame.pack_propagate(False)
+
+        button_frame = ttk.Frame(action_frame)
+        button_frame.pack(side='left', padx=10, pady=5)  # Increased left padding
+
+        # Stack buttons vertically
+        self.download_btn = ttk.Button(button_frame, text="Download OHLC data", 
+                                     command=self.start_download, width=20)
+        self.download_btn.pack(pady=(5, 2))
+        
+        self.interrupt_btn = ttk.Button(button_frame, text="Interrupt Download", 
+                                      command=self.interrupt_download, width=20)
+        self.interrupt_btn.pack(pady=(2, 5))
+        self.interrupt_btn.state(['disabled'])
+
+        # Warning notice next to buttons with more space
+        notice = ttk.Label(action_frame, 
+                          text="* Data will not be downloaded\nwithout selecting a save location",
+                          foreground='red',
+                          justify='left',
+                          wraplength=200)  # Added wraplength to control text width
+        notice.pack(side='left', padx=15, pady=5)  # Increased padding
+
+        # Progress bar and status label
+        self.progress_var = tk.DoubleVar()
+        self.progress = ttk.Progressbar(self.root, variable=self.progress_var, maximum=100)
+        self.progress.pack(fill='x', padx=20, pady=(15, 5))
+        
+        self.status_label = ttk.Label(self.root, text="")
+        self.status_label.pack(pady=(0, 5))
+
+        self.interrupt_flag = False
+
+    def load_tickers(self):
+        file_path = filedialog.askopenfilename(
+            filetypes=[("CSV files", "*.csv"), ("Text files", "*.txt"), ("Excel files", "*.xlsx;*.xls")]
+        )
+        if not file_path:
+            return
+            
+        try:
+            if file_path.endswith('.csv'):
+                df = pd.read_csv(file_path)
+            elif file_path.endswith(('.xlsx', '.xls')):
+                df = pd.read_excel(file_path)
+            else:
+                with open(file_path, 'r') as f:
+                    tickers = f.read()
+                self.ticker_text.delete('1.0', tk.END)
+                self.ticker_text.insert('1.0', tickers)
+                return
+                
+            # Extract tickers from DataFrame
+            tickers = df.iloc[:, 0].tolist()
+            self.ticker_text.delete('1.0', tk.END)
+            self.ticker_text.insert('1.0', ','.join(str(t) for t in tickers))
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load tickers: {str(e)}")
+
+    def get_tickers(self):
+        text = self.ticker_text.get('1.0', tk.END).strip()
+        if not text:
+            return []
+        # Split by either comma or newline
+        tickers = [t.strip() for t in text.replace('\n', ',').split(',')]
+        return [t for t in tickers if t]  # Remove empty strings
+
+    def start_download(self):
+        tickers = self.get_tickers()
+        if not tickers:
+            messagebox.showwarning("Warning", "No tickers provided to pull data for")
+            return
+            
+        save_path = filedialog.askdirectory()
+        if not save_path:
+            messagebox.showwarning("Warning", "No save location was selected")
+            return
+            
+        self.save_location = Path(save_path)
+        self.download_in_progress = True  # Set flag when download starts
+        
+        # Disable controls during download
+        self.download_btn.state(['disabled'])
+        self.ticker_text.config(state='disabled')
+        
+        # Start download in separate thread
+        thread = threading.Thread(target=self.download_data, args=(tickers,))
+        thread.daemon = True  # Make thread daemon so it exits when main thread exits
+        thread.start()
+
+    def interrupt_download(self):
+        self.interrupt_flag = True
+        self.status_label.config(text="Interrupting download...")
+        
+    def download_data(self, tickers):
+        try:
+            self.interrupt_flag = False
+            self.interrupt_btn.state(['!disabled'])
+            interval = self.freq_var.get()
+            
+            start_date = self.start_date.get_date()
+            end_date = self.end_date.get_date()
+            date_range = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+            
+            total = len(tickers)
+            all_data = []
+            
+            for i, ticker in enumerate(tickers, 1):
+                if self.interrupt_flag:
+                    break
+                    
+                self.status_label.config(text=f"Processing {ticker}...")
+                self.progress_var.set((i/total) * 100)
+                self.root.update_idletasks()
+                
+                for suffix in ['.NS', '.BO']:
+                    try:
+                        symbol = f"{ticker.rstrip('.NS').rstrip('.BO')}{suffix}"
+                        stock = yf.Ticker(symbol)
+                        df = stock.history(start=start_date, end=end_date, interval=interval)
+                        
+                        if df.empty:
+                            logging.info(f"{symbol} - No price data available for {date_range}")
+                            continue
+                            
+                        # Keep only required columns and remove timezone
+                        df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+                        df.index = df.index.tz_localize(None)
+                        df['Symbol'] = symbol
+                        all_data.append(df)
+                        break
+                    except Exception as e:
+                        # Skip logging if it's just a timezone warning
+                        if not str(e).lower().startswith('no timezone'):
+                            logging.info(f"{symbol} - Not found")
+                        continue
+
+            if all_data:
+                final_df = pd.concat(all_data)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                file_path = self.save_location / f"ohlc_data_{timestamp}.csv"
+                
+                # Ensure columns are in the correct order
+                columns = ['Symbol'] + ['Open', 'High', 'Low', 'Close', 'Volume']
+                final_df = final_df.reset_index()
+                final_df = final_df.rename(columns={'index': 'Date'})
+                final_df = final_df[['Date'] + columns]
+                
+                final_df.to_csv(file_path, index=False)
+                
+                if self.interrupt_flag:
+                    messagebox.showinfo("Interrupted", "Download interrupted. Partial data has been saved.")
+                else:
+                    messagebox.showinfo("Success", f"Data saved to {file_path}")
+            else:
+                messagebox.showwarning("Warning", "No data was downloaded")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Download failed: {str(e)}")
+            
+        finally:
+            self.interrupt_flag = False
+            self.interrupt_btn.state(['disabled'])
+            self.download_btn.state(['!disabled'])
+            self.ticker_text.config(state='normal')
+            self.status_label.config(text="")
+            self.progress_var.set(0)
+            self.download_in_progress = False  # Reset flag when download completes
+
+def main():
+    root = tk.Tk()
+    app = OHLCDownloader(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
